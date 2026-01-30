@@ -112,34 +112,29 @@ struct Queue {
     all_tasks_done: Condvar,
 }
 
-/// Parse timeout: None => None, negative => None (treated as infinite), positive => Some(Duration)
+/// Parse timeout: None/PyNone/negative => None (infinite), positive => Some(Duration).
 fn parse_timeout(timeout: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Duration>> {
-    match timeout {
-        None => Ok(None),
-        Some(obj) => {
-            if obj.is_none() {
-                return Ok(None);
-            }
-            let secs: f64 = obj.extract()?;
-            if secs < 0.0 {
-                Ok(None)
-            } else {
-                Ok(Some(Duration::from_secs_f64(secs)))
-            }
-        }
+    let Some(obj) = timeout else { return Ok(None) };
+    if obj.is_none() {
+        return Ok(None);
+    }
+    let secs: f64 = obj.extract()?;
+    if secs < 0.0 {
+        Ok(None)
+    } else {
+        Ok(Some(Duration::from_secs_f64(secs)))
     }
 }
 
-/// Attempt a non-blocking put on an already-locked queue.
+/// Attempt to put an item. Returns `Full(item)` if the queue is full.
 enum PutOutcome {
     Done,
-    NeedBlock(Py<PyAny>),
+    Full(Py<PyAny>),
 }
 
 fn try_put(
     inner: &mut QueueInner,
     item: Py<PyAny>,
-    block: bool,
     not_empty: &Condvar,
 ) -> Result<PutOutcome, QueueError> {
     #[cfg(Py_3_13)]
@@ -154,23 +149,16 @@ fn try_put(
         }
         return Ok(PutOutcome::Done);
     }
-    if !block {
-        return Err(QueueError::Full);
-    }
-    Ok(PutOutcome::NeedBlock(item))
+    Ok(PutOutcome::Full(item))
 }
 
-/// Attempt a non-blocking get on an already-locked queue.
+/// Attempt to get an item. Returns `Empty` if the queue is empty.
 enum GetOutcome {
     Done(Py<PyAny>),
-    NeedBlock,
+    Empty,
 }
 
-fn try_get(
-    inner: &mut QueueInner,
-    block: bool,
-    not_full: &Condvar,
-) -> Result<GetOutcome, QueueError> {
+fn try_get(inner: &mut QueueInner, not_full: &Condvar) -> Result<GetOutcome, QueueError> {
     if let Some(item) = inner.items.pop_front() {
         if inner.not_full_waiters > 0 {
             not_full.notify_one();
@@ -181,10 +169,7 @@ fn try_get(
     if inner.is_shutdown {
         return Err(QueueError::ShutDown);
     }
-    if !block {
-        return Err(QueueError::Empty);
-    }
-    Ok(GetOutcome::NeedBlock)
+    Ok(GetOutcome::Empty)
 }
 
 #[pymethods]
@@ -228,9 +213,12 @@ impl Queue {
     ) -> PyResult<()> {
         // Fast path: try-lock without detaching from the interpreter.
         if let Some(mut inner) = self.inner.try_lock() {
-            match try_put(&mut inner, item, block, &self.not_empty) {
+            match try_put(&mut inner, item, &self.not_empty) {
                 Ok(PutOutcome::Done) => return Ok(()),
-                Ok(PutOutcome::NeedBlock(item_back)) => {
+                Ok(PutOutcome::Full(item_back)) => {
+                    if !block {
+                        return Err(full_err());
+                    }
                     drop(inner);
                     return self.put_slow(py, item_back, timeout);
                 }
@@ -239,21 +227,23 @@ impl Queue {
         }
 
         // Contended — detach and lock.
-        self.put_slow(py, item, timeout)
+        if block {
+            self.put_slow(py, item, timeout)
+        } else {
+            py.detach(|| {
+                let mut inner = self.inner.lock();
+                match try_put(&mut inner, item, &self.not_empty) {
+                    Ok(PutOutcome::Done) => Ok(()),
+                    Ok(PutOutcome::Full(_)) => Err(QueueError::Full),
+                    Err(e) => Err(e),
+                }
+            })
+            .map_err(|e| e.into_pyerr())
+        }
     }
 
     fn put_nowait(&self, py: Python<'_>, item: Py<PyAny>) -> PyResult<()> {
-        if let Some(mut inner) = self.inner.try_lock() {
-            return try_put(&mut inner, item, false, &self.not_empty)
-                .map(|_| ())
-                .map_err(|e| e.into_pyerr());
-        }
-
-        py.detach(|| {
-            let mut inner = self.inner.lock();
-            try_put(&mut inner, item, false, &self.not_empty).map(|_| ())
-        })
-        .map_err(|e| e.into_pyerr())
+        self.put(py, item, false, None)
     }
 
     #[pyo3(signature = (block=true, timeout=None))]
@@ -265,9 +255,12 @@ impl Queue {
     ) -> PyResult<Py<PyAny>> {
         // Fast path: try-lock without detaching.
         if let Some(mut inner) = self.inner.try_lock() {
-            match try_get(&mut inner, block, &self.not_full) {
+            match try_get(&mut inner, &self.not_full) {
                 Ok(GetOutcome::Done(item)) => return Ok(item),
-                Ok(GetOutcome::NeedBlock) => {
+                Ok(GetOutcome::Empty) => {
+                    if !block {
+                        return Err(empty_err());
+                    }
                     drop(inner);
                     return self.get_slow(py, timeout);
                 }
@@ -276,27 +269,23 @@ impl Queue {
         }
 
         // Contended — detach and lock.
-        self.get_slow(py, timeout)
+        if block {
+            self.get_slow(py, timeout)
+        } else {
+            py.detach(|| {
+                let mut inner = self.inner.lock();
+                match try_get(&mut inner, &self.not_full) {
+                    Ok(GetOutcome::Done(item)) => Ok(item),
+                    Ok(GetOutcome::Empty) => Err(QueueError::Empty),
+                    Err(e) => Err(e),
+                }
+            })
+            .map_err(|e| e.into_pyerr())
+        }
     }
 
     fn get_nowait(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if let Some(mut inner) = self.inner.try_lock() {
-            return match try_get(&mut inner, false, &self.not_full) {
-                Ok(GetOutcome::Done(item)) => Ok(item),
-                Ok(GetOutcome::NeedBlock) => unreachable!(),
-                Err(e) => Err(e.into_pyerr()),
-            };
-        }
-
-        py.detach(|| {
-            let mut inner = self.inner.lock();
-            match try_get(&mut inner, false, &self.not_full) {
-                Ok(GetOutcome::Done(item)) => Ok(item),
-                Ok(GetOutcome::NeedBlock) => unreachable!(),
-                Err(e) => Err(e),
-            }
-        })
-        .map_err(|e| e.into_pyerr())
+        self.get(py, false, None)
     }
 
     fn task_done(&self, py: Python<'_>) -> PyResult<()> {
