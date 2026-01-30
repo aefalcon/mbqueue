@@ -1,19 +1,38 @@
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 
 // ---------------------------------------------------------------------------
-// Exception classes
+// Cached exception types from the `queue` stdlib module
 // ---------------------------------------------------------------------------
 
-pyo3::create_exception!(mbqueue, Empty, pyo3::exceptions::PyException);
-pyo3::create_exception!(mbqueue, Full, pyo3::exceptions::PyException);
+static QUEUE_EMPTY: OnceLock<Py<PyType>> = OnceLock::new();
+static QUEUE_FULL: OnceLock<Py<PyType>> = OnceLock::new();
+#[cfg(Py_3_13)]
+static QUEUE_SHUTDOWN: OnceLock<Py<PyType>> = OnceLock::new();
+
+fn empty_err() -> PyErr {
+    Python::attach(|py| PyErr::from_type(QUEUE_EMPTY.get().unwrap().bind(py).clone(), ""))
+}
+
+fn full_err() -> PyErr {
+    Python::attach(|py| PyErr::from_type(QUEUE_FULL.get().unwrap().bind(py).clone(), ""))
+}
 
 #[cfg(Py_3_13)]
-pyo3::create_exception!(mbqueue, ShutDown, pyo3::exceptions::PyException);
+fn shutdown_err() -> PyErr {
+    Python::attach(|py| {
+        PyErr::from_type(
+            QUEUE_SHUTDOWN.get().unwrap().bind(py).clone(),
+            "the queue has been shut down",
+        )
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Internal error type (used inside detach closures)
@@ -29,10 +48,10 @@ enum QueueError {
 impl QueueError {
     fn into_pyerr(self) -> PyErr {
         match self {
-            QueueError::Empty => Empty::new_err(""),
-            QueueError::Full => Full::new_err(""),
+            QueueError::Empty => empty_err(),
+            QueueError::Full => full_err(),
             #[cfg(Py_3_13)]
-            QueueError::ShutDown => ShutDown::new_err("the queue has been shut down"),
+            QueueError::ShutDown => shutdown_err(),
         }
     }
 }
@@ -107,9 +126,6 @@ fn parse_timeout(timeout: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Duration
 }
 
 /// Helper: execute the put logic on an already-locked guard.
-/// Returns Ok(()) on success, Err(item) if the queue is full or shut down
-/// and we need to fall through to the slow path. Returns PyResult for
-/// shutdown/full errors that should be raised immediately.
 enum PutFast {
     Done,
     NeedBlock(Py<PyAny>),
@@ -123,7 +139,7 @@ fn try_put_fast(
 ) -> Result<PutFast, PyErr> {
     #[cfg(Py_3_13)]
     if inner.is_shutdown {
-        return Err(ShutDown::new_err("the queue has been shut down"));
+        return Err(shutdown_err());
     }
     if !inner.is_full() {
         inner.items.push_back(item);
@@ -134,7 +150,7 @@ fn try_put_fast(
         return Ok(PutFast::Done);
     }
     if !block {
-        return Err(Full::new_err(""));
+        return Err(full_err());
     }
     Ok(PutFast::NeedBlock(item))
 }
@@ -158,10 +174,10 @@ fn try_get_fast(
     }
     #[cfg(Py_3_13)]
     if inner.is_shutdown {
-        return Err(ShutDown::new_err("the queue has been shut down"));
+        return Err(shutdown_err());
     }
     if !block {
-        return Err(Empty::new_err(""));
+        return Err(empty_err());
     }
     Ok(GetFast::NeedBlock)
 }
@@ -492,12 +508,29 @@ impl Queue {
 // Module
 // ---------------------------------------------------------------------------
 
+/// Import a type from a Python module and return it as `Py<PyType>`.
+fn import_type(py: Python<'_>, module: &str, name: &str) -> PyResult<Py<PyType>> {
+    let ty = py.import(module)?.getattr(name)?;
+    Ok(ty.cast_into::<PyType>()?.unbind())
+}
+
 #[pymodule(gil_used = false)]
-fn mbqueue(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<Queue>()?;
-    m.add("Empty", m.py().get_type::<Empty>())?;
-    m.add("Full", m.py().get_type::<Full>())?;
+fn mbqueue(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Cache stdlib exception types.
+    QUEUE_EMPTY.set(import_type(py, "queue", "Empty")?).unwrap();
+    QUEUE_FULL.set(import_type(py, "queue", "Full")?).unwrap();
     #[cfg(Py_3_13)]
-    m.add("ShutDown", m.py().get_type::<ShutDown>())?;
+    QUEUE_SHUTDOWN
+        .set(import_type(py, "queue", "ShutDown")?)
+        .unwrap();
+
+    m.add_class::<Queue>()?;
+
+    // Re-export stdlib exception types as mbqueue.Empty, mbqueue.Full, etc.
+    m.add("Empty", QUEUE_EMPTY.get().unwrap().bind(py))?;
+    m.add("Full", QUEUE_FULL.get().unwrap().bind(py))?;
+    #[cfg(Py_3_13)]
+    m.add("ShutDown", QUEUE_SHUTDOWN.get().unwrap().bind(py))?;
+
     Ok(())
 }

@@ -457,3 +457,65 @@ class TestEdgeCases:
         assert issubclass(mbqueue.Full, Exception)
         if HAS_SHUTDOWN:
             assert issubclass(mbqueue.ShutDown, Exception)
+
+
+# ---------------------------------------------------------------------------
+# Exception compatibility with stdlib queue module
+# ---------------------------------------------------------------------------
+
+
+class TestExceptionCompat:
+    def test_empty_is_queue_empty(self):
+        import queue
+
+        assert mbqueue.Empty is queue.Empty
+
+    def test_full_is_queue_full(self):
+        import queue
+
+        assert mbqueue.Full is queue.Full
+
+    def test_shutdown_is_queue_shutdown(self):
+        _skip_unless_shutdown()
+        import queue
+
+        assert mbqueue.ShutDown is queue.ShutDown
+
+    def test_catch_empty_as_queue_empty(self):
+        import queue
+
+        q = mbqueue.Queue()
+        with pytest.raises(queue.Empty):
+            q.get_nowait()
+
+    def test_catch_full_as_queue_full(self):
+        import queue
+
+        q = mbqueue.Queue(maxsize=1)
+        q.put(1)
+        with pytest.raises(queue.Full):
+            q.put_nowait(2)
+
+    def test_catch_shutdown_as_queue_shutdown(self):
+        _skip_unless_shutdown()
+        import queue
+
+        q = mbqueue.Queue()
+        q.shutdown()
+        with pytest.raises(queue.ShutDown):
+            q.put(1)
+
+    def test_get_timeout_raises_queue_empty(self):
+        import queue
+
+        q = mbqueue.Queue()
+        with pytest.raises(queue.Empty):
+            q.get(timeout=0.01)
+
+    def test_put_timeout_raises_queue_full(self):
+        import queue
+
+        q = mbqueue.Queue(maxsize=1)
+        q.put(1)
+        with pytest.raises(queue.Full):
+            q.put(2, timeout=0.01)
