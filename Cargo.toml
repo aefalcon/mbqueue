@@ -3,6 +3,7 @@ name = "mbqueue"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Fast queue.Queue replacement implemented in Rust"
 
 [lib]
 name = "mbqueue"

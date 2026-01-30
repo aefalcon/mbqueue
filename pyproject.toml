@@ -5,8 +5,11 @@ build-backend = "maturin"
 [project]
 name = "mbqueue"
 version = "0.1.0"
+description = "Fast queue.Queue replacement implemented in Rust"
 requires-python = ">=3.9"
 license = "MIT"
+readme = "README.md"
+authors = [{ name = "Andrew E. Falcon", email = "aefalcon@gmail.com" }]
 keywords = ["queue", "threading", "performance", "free-threaded"]
 classifiers = [
     "Development Status :: 3 - Alpha",
