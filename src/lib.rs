@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use parking_lot::{Condvar, Mutex};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
@@ -88,6 +88,15 @@ impl QueueInner {
     fn is_full(&self) -> bool {
         self.effective_maxsize > 0 && self.items.len() >= self.effective_maxsize
     }
+
+    /// Decrement unfinished_tasks. Returns `true` if joiners should be notified.
+    fn complete_task(&mut self) -> PyResult<bool> {
+        if self.unfinished_tasks == 0 {
+            return Err(PyValueError::new_err("task_done() called too many times"));
+        }
+        self.unfinished_tasks -= 1;
+        Ok(self.unfinished_tasks == 0 && self.all_tasks_done_waiters > 0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,21 +130,21 @@ fn parse_timeout(timeout: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Duration
     }
 }
 
-/// Helper: execute the put logic on an already-locked guard.
-enum PutFast {
+/// Attempt a non-blocking put on an already-locked queue.
+enum PutOutcome {
     Done,
     NeedBlock(Py<PyAny>),
 }
 
-fn try_put_fast(
-    inner: &mut MutexGuard<'_, QueueInner>,
+fn try_put(
+    inner: &mut QueueInner,
     item: Py<PyAny>,
     block: bool,
     not_empty: &Condvar,
-) -> Result<PutFast, PyErr> {
+) -> Result<PutOutcome, QueueError> {
     #[cfg(Py_3_13)]
     if inner.is_shutdown {
-        return Err(shutdown_err());
+        return Err(QueueError::ShutDown);
     }
     if !inner.is_full() {
         inner.items.push_back(item);
@@ -143,39 +152,39 @@ fn try_put_fast(
         if inner.not_empty_waiters > 0 {
             not_empty.notify_one();
         }
-        return Ok(PutFast::Done);
+        return Ok(PutOutcome::Done);
     }
     if !block {
-        return Err(full_err());
+        return Err(QueueError::Full);
     }
-    Ok(PutFast::NeedBlock(item))
+    Ok(PutOutcome::NeedBlock(item))
 }
 
-/// Helper: execute the get logic on an already-locked guard.
-enum GetFast {
+/// Attempt a non-blocking get on an already-locked queue.
+enum GetOutcome {
     Done(Py<PyAny>),
     NeedBlock,
 }
 
-fn try_get_fast(
-    inner: &mut MutexGuard<'_, QueueInner>,
+fn try_get(
+    inner: &mut QueueInner,
     block: bool,
     not_full: &Condvar,
-) -> Result<GetFast, PyErr> {
+) -> Result<GetOutcome, QueueError> {
     if let Some(item) = inner.items.pop_front() {
         if inner.not_full_waiters > 0 {
             not_full.notify_one();
         }
-        return Ok(GetFast::Done(item));
+        return Ok(GetOutcome::Done(item));
     }
     #[cfg(Py_3_13)]
     if inner.is_shutdown {
-        return Err(shutdown_err());
+        return Err(QueueError::ShutDown);
     }
     if !block {
-        return Err(empty_err());
+        return Err(QueueError::Empty);
     }
-    Ok(GetFast::NeedBlock)
+    Ok(GetOutcome::NeedBlock)
 }
 
 #[pymethods]
@@ -219,13 +228,13 @@ impl Queue {
     ) -> PyResult<()> {
         // Fast path: try-lock without detaching from the interpreter.
         if let Some(mut inner) = self.inner.try_lock() {
-            match try_put_fast(&mut inner, item, block, &self.not_empty)? {
-                PutFast::Done => return Ok(()),
-                PutFast::NeedBlock(item_back) => {
-                    // Need to block — drop lock, fall through to slow path.
+            match try_put(&mut inner, item, block, &self.not_empty) {
+                Ok(PutOutcome::Done) => return Ok(()),
+                Ok(PutOutcome::NeedBlock(item_back)) => {
                     drop(inner);
                     return self.put_slow(py, item_back, timeout);
                 }
+                Err(e) => return Err(e.into_pyerr()),
             }
         }
 
@@ -234,37 +243,17 @@ impl Queue {
     }
 
     fn put_nowait(&self, py: Python<'_>, item: Py<PyAny>) -> PyResult<()> {
-        // Fast path: try-lock without detaching.
         if let Some(mut inner) = self.inner.try_lock() {
-            return match try_put_fast(&mut inner, item, false, &self.not_empty) {
-                Ok(PutFast::Done) => Ok(()),
-                Ok(PutFast::NeedBlock(_)) => unreachable!(),
-                Err(e) => Err(e),
-            };
+            return try_put(&mut inner, item, false, &self.not_empty)
+                .map(|_| ())
+                .map_err(|e| e.into_pyerr());
         }
 
-        // Contended — fall back to detach + lock.
-        let result = py.detach(|| {
+        py.detach(|| {
             let mut inner = self.inner.lock();
-
-            #[cfg(Py_3_13)]
-            if inner.is_shutdown {
-                return Err(QueueError::ShutDown);
-            }
-
-            if inner.is_full() {
-                return Err(QueueError::Full);
-            }
-
-            inner.items.push_back(item);
-            inner.unfinished_tasks += 1;
-            if inner.not_empty_waiters > 0 {
-                self.not_empty.notify_one();
-            }
-            Ok(())
-        });
-
-        result.map_err(|e| e.into_pyerr())
+            try_put(&mut inner, item, false, &self.not_empty).map(|_| ())
+        })
+        .map_err(|e| e.into_pyerr())
     }
 
     #[pyo3(signature = (block=true, timeout=None))]
@@ -276,12 +265,13 @@ impl Queue {
     ) -> PyResult<Py<PyAny>> {
         // Fast path: try-lock without detaching.
         if let Some(mut inner) = self.inner.try_lock() {
-            match try_get_fast(&mut inner, block, &self.not_full)? {
-                GetFast::Done(item) => return Ok(item),
-                GetFast::NeedBlock => {
+            match try_get(&mut inner, block, &self.not_full) {
+                Ok(GetOutcome::Done(item)) => return Ok(item),
+                Ok(GetOutcome::NeedBlock) => {
                     drop(inner);
                     return self.get_slow(py, timeout);
                 }
+                Err(e) => return Err(e.into_pyerr()),
             }
         }
 
@@ -290,44 +280,28 @@ impl Queue {
     }
 
     fn get_nowait(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        // Fast path: try-lock without detaching.
         if let Some(mut inner) = self.inner.try_lock() {
-            return match try_get_fast(&mut inner, false, &self.not_full) {
-                Ok(GetFast::Done(item)) => Ok(item),
-                Ok(GetFast::NeedBlock) => unreachable!(),
-                Err(e) => Err(e),
+            return match try_get(&mut inner, false, &self.not_full) {
+                Ok(GetOutcome::Done(item)) => Ok(item),
+                Ok(GetOutcome::NeedBlock) => unreachable!(),
+                Err(e) => Err(e.into_pyerr()),
             };
         }
 
-        // Contended — fall back to detach + lock.
-        let result: Result<Py<PyAny>, QueueError> = py.detach(|| {
+        py.detach(|| {
             let mut inner = self.inner.lock();
-
-            if let Some(item) = inner.items.pop_front() {
-                if inner.not_full_waiters > 0 {
-                    self.not_full.notify_one();
-                }
-                return Ok(item);
+            match try_get(&mut inner, false, &self.not_full) {
+                Ok(GetOutcome::Done(item)) => Ok(item),
+                Ok(GetOutcome::NeedBlock) => unreachable!(),
+                Err(e) => Err(e),
             }
-
-            #[cfg(Py_3_13)]
-            if inner.is_shutdown {
-                return Err(QueueError::ShutDown);
-            }
-
-            Err(QueueError::Empty)
-        });
-
-        result.map_err(|e| e.into_pyerr())
+        })
+        .map_err(|e| e.into_pyerr())
     }
 
     fn task_done(&self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut inner) = self.inner.try_lock() {
-            if inner.unfinished_tasks == 0 {
-                return Err(PyValueError::new_err("task_done() called too many times"));
-            }
-            inner.unfinished_tasks -= 1;
-            if inner.unfinished_tasks == 0 && inner.all_tasks_done_waiters > 0 {
+            if inner.complete_task()? {
                 self.all_tasks_done.notify_all();
             }
             return Ok(());
@@ -335,11 +309,7 @@ impl Queue {
 
         py.detach(|| {
             let mut inner = self.inner.lock();
-            if inner.unfinished_tasks == 0 {
-                return Err(PyValueError::new_err("task_done() called too many times"));
-            }
-            inner.unfinished_tasks -= 1;
-            if inner.unfinished_tasks == 0 && inner.all_tasks_done_waiters > 0 {
+            if inner.complete_task()? {
                 self.all_tasks_done.notify_all();
             }
             Ok(())

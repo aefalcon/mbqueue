@@ -234,7 +234,6 @@ class TestBlocking:
     def test_put_blocks_on_full(self):
         q = mbqueue.Queue(maxsize=1)
         q.put("a")
-        done = threading.Event()
 
         def consumer():
             time.sleep(0.05)
