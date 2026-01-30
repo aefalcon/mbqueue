@@ -6,6 +6,7 @@ build-backend = "maturin"
 name = "mbqueue"
 version = "0.1.0"
 requires-python = ">=3.9"
+license = "MIT"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
