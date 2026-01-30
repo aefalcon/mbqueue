@@ -19,6 +19,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 
+[project.urls]
+Source = "https://github.com/aefalcon/mbqueue"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 
