@@ -148,6 +148,28 @@ impl Queue {
         block: bool,
         timeout: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        // Fast path: try-lock without detaching from the interpreter.
+        if let Ok(mut inner) = self.inner.try_lock() {
+            #[cfg(Py_3_13)]
+            if inner.is_shutdown {
+                return Err(ShutDown::new_err("the queue has been shut down"));
+            }
+            if !inner.is_full() {
+                inner.items.push_back(item);
+                inner.unfinished_tasks += 1;
+                if inner.not_empty_waiters > 0 {
+                    self.not_empty.notify_one();
+                }
+                return Ok(());
+            }
+            if !block {
+                return Err(Full::new_err(""));
+            }
+            // Need to block — drop the lock and fall through to slow path.
+            drop(inner);
+        }
+
+        // Slow path: detach from interpreter, lock, and wait.
         let deadline = if block {
             parse_timeout(timeout)?.map(|d| Instant::now() + d)
         } else {
@@ -206,6 +228,24 @@ impl Queue {
     }
 
     fn put_nowait(&self, py: Python<'_>, item: Py<PyAny>) -> PyResult<()> {
+        // Fast path: try-lock without detaching.
+        if let Ok(mut inner) = self.inner.try_lock() {
+            #[cfg(Py_3_13)]
+            if inner.is_shutdown {
+                return Err(ShutDown::new_err("the queue has been shut down"));
+            }
+            if inner.is_full() {
+                return Err(Full::new_err(""));
+            }
+            inner.items.push_back(item);
+            inner.unfinished_tasks += 1;
+            if inner.not_empty_waiters > 0 {
+                self.not_empty.notify_one();
+            }
+            return Ok(());
+        }
+
+        // Contended — fall back to detach + lock.
         let result = py.detach(|| {
             let mut inner = self.inner.lock().unwrap();
 
@@ -236,6 +276,26 @@ impl Queue {
         block: bool,
         timeout: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        // Fast path: try-lock without detaching.
+        if let Ok(mut inner) = self.inner.try_lock() {
+            if let Some(item) = inner.items.pop_front() {
+                if inner.not_full_waiters > 0 {
+                    self.not_full.notify_one();
+                }
+                return Ok(item);
+            }
+            #[cfg(Py_3_13)]
+            if inner.is_shutdown {
+                return Err(ShutDown::new_err("the queue has been shut down"));
+            }
+            if !block {
+                return Err(Empty::new_err(""));
+            }
+            // Need to block — drop the lock and fall through to slow path.
+            drop(inner);
+        }
+
+        // Slow path: detach from interpreter, lock, and wait.
         let deadline = if block {
             parse_timeout(timeout)?.map(|d| Instant::now() + d)
         } else {
@@ -294,6 +354,22 @@ impl Queue {
     }
 
     fn get_nowait(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Fast path: try-lock without detaching.
+        if let Ok(mut inner) = self.inner.try_lock() {
+            if let Some(item) = inner.items.pop_front() {
+                if inner.not_full_waiters > 0 {
+                    self.not_full.notify_one();
+                }
+                return Ok(item);
+            }
+            #[cfg(Py_3_13)]
+            if inner.is_shutdown {
+                return Err(ShutDown::new_err("the queue has been shut down"));
+            }
+            return Err(Empty::new_err(""));
+        }
+
+        // Contended — fall back to detach + lock.
         let result: Result<Py<PyAny>, QueueError> = py.detach(|| {
             let mut inner = self.inner.lock().unwrap();
 
@@ -316,6 +392,17 @@ impl Queue {
     }
 
     fn task_done(&self, py: Python<'_>) -> PyResult<()> {
+        if let Ok(mut inner) = self.inner.try_lock() {
+            if inner.unfinished_tasks == 0 {
+                return Err(PyValueError::new_err("task_done() called too many times"));
+            }
+            inner.unfinished_tasks -= 1;
+            if inner.unfinished_tasks == 0 && inner.all_tasks_done_waiters > 0 {
+                self.all_tasks_done.notify_all();
+            }
+            return Ok(());
+        }
+
         py.detach(|| {
             let mut inner = self.inner.lock().unwrap();
             if inner.unfinished_tasks == 0 {
