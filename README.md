@@ -57,6 +57,8 @@ uv run python -m pytest tests/bench_queue.py -v
   `parking_lot::Mutex` and three `Condvar`s (`not_empty`, `not_full`,
   `all_tasks_done`), mirroring CPython's design.
 - `py.detach()` releases the interpreter before blocking on a condvar.
+- Blocking waits poll every 100ms to check for pending Python signals, so
+  Ctrl+C interrupts `put()`, `get()`, and `join()` promptly.
 - Try-lock fast path avoids interpreter detach on uncontended operations.
 - `shutdown()` is available on Python 3.13+ (`#[cfg(Py_3_13)]`).
 - GC integration via `__traverse__` / `__clear__`.

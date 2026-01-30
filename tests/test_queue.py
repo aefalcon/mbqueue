@@ -1,3 +1,5 @@
+import os
+import signal
 import sys
 import threading
 import time
@@ -518,3 +520,24 @@ class TestExceptionCompat:
         q.put(1)
         with pytest.raises(queue.Full):
             q.put(2, timeout=0.01)
+
+
+# ---------------------------------------------------------------------------
+# SIGINT interruptibility
+# ---------------------------------------------------------------------------
+
+
+class TestSigint:
+    def test_blocking_get_interrupted_by_sigint(self):
+        """A blocking get() should raise KeyboardInterrupt when SIGINT is sent."""
+        q = mbqueue.Queue()
+
+        def send_sigint():
+            time.sleep(0.2)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        t = threading.Thread(target=send_sigint)
+        t.start()
+        with pytest.raises(KeyboardInterrupt):
+            q.get()  # blocks until SIGINT
+        t.join()

@@ -7,6 +7,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 // ---------------------------------------------------------------------------
 // Cached exception types from the `queue` stdlib module
 // ---------------------------------------------------------------------------
@@ -43,6 +45,7 @@ enum QueueError {
     Full,
     #[cfg(Py_3_13)]
     ShutDown,
+    Interrupted(PyErr),
 }
 
 impl QueueError {
@@ -52,8 +55,13 @@ impl QueueError {
             QueueError::Full => full_err(),
             #[cfg(Py_3_13)]
             QueueError::ShutDown => shutdown_err(),
+            QueueError::Interrupted(e) => e,
         }
     }
+}
+
+fn check_signals() -> Result<(), QueueError> {
+    Python::attach(|py| py.check_signals()).map_err(QueueError::Interrupted)
 }
 
 // ---------------------------------------------------------------------------
@@ -305,15 +313,18 @@ impl Queue {
         })
     }
 
-    fn join(&self, py: Python<'_>) {
+    fn join(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| {
             let mut inner = self.inner.lock();
             while inner.unfinished_tasks > 0 {
                 inner.all_tasks_done_waiters += 1;
-                self.all_tasks_done.wait(&mut inner);
+                self.all_tasks_done
+                    .wait_for(&mut inner, SIGNAL_POLL_INTERVAL);
                 inner.all_tasks_done_waiters -= 1;
+                check_signals().map_err(|e| e.into_pyerr())?;
             }
-        });
+            Ok(())
+        })
     }
 
     #[cfg(Py_3_13)]
@@ -378,24 +389,20 @@ impl Queue {
                 }
 
                 inner.not_full_waiters += 1;
-                match deadline {
+                let wait_time = match deadline {
                     Some(dl) => {
                         let now = Instant::now();
                         if now >= dl {
                             inner.not_full_waiters -= 1;
                             return Err(QueueError::Full);
                         }
-                        let timed_out = self.not_full.wait_for(&mut inner, dl - now).timed_out();
-                        inner.not_full_waiters -= 1;
-                        if timed_out && inner.is_full() {
-                            return Err(QueueError::Full);
-                        }
+                        (dl - now).min(SIGNAL_POLL_INTERVAL)
                     }
-                    None => {
-                        self.not_full.wait(&mut inner);
-                        inner.not_full_waiters -= 1;
-                    }
-                }
+                    None => SIGNAL_POLL_INTERVAL,
+                };
+                self.not_full.wait_for(&mut inner, wait_time);
+                inner.not_full_waiters -= 1;
+                check_signals()?;
             }
 
             inner.items.push_back(item);
@@ -429,28 +436,20 @@ impl Queue {
                 }
 
                 inner.not_empty_waiters += 1;
-                match deadline {
+                let wait_time = match deadline {
                     Some(dl) => {
                         let now = Instant::now();
                         if now >= dl {
                             inner.not_empty_waiters -= 1;
                             return Err(QueueError::Empty);
                         }
-                        let timed_out = self.not_empty.wait_for(&mut inner, dl - now).timed_out();
-                        inner.not_empty_waiters -= 1;
-                        if timed_out && inner.items.is_empty() {
-                            #[cfg(Py_3_13)]
-                            if inner.is_shutdown {
-                                return Err(QueueError::ShutDown);
-                            }
-                            return Err(QueueError::Empty);
-                        }
+                        (dl - now).min(SIGNAL_POLL_INTERVAL)
                     }
-                    None => {
-                        self.not_empty.wait(&mut inner);
-                        inner.not_empty_waiters -= 1;
-                    }
-                }
+                    None => SIGNAL_POLL_INTERVAL,
+                };
+                self.not_empty.wait_for(&mut inner, wait_time);
+                inner.not_empty_waiters -= 1;
+                check_signals()?;
             }
         });
 
