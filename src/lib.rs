@@ -69,8 +69,6 @@ struct QueueInner {
     all_tasks_done_waiters: usize,
     #[cfg(Py_3_13)]
     is_shutdown: bool,
-    #[cfg(Py_3_13)]
-    is_shutdown_immediate: bool,
 }
 
 impl QueueInner {
@@ -84,8 +82,6 @@ impl QueueInner {
             all_tasks_done_waiters: 0,
             #[cfg(Py_3_13)]
             is_shutdown: false,
-            #[cfg(Py_3_13)]
-            is_shutdown_immediate: false,
         }
     }
 
@@ -369,7 +365,6 @@ impl Queue {
             inner.is_shutdown = true;
 
             if immediate {
-                inner.is_shutdown_immediate = true;
                 let drained = inner.items.len();
                 inner.items.clear();
                 inner.unfinished_tasks = inner.unfinished_tasks.saturating_sub(drained);
