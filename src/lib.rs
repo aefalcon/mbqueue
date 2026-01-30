@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -106,6 +106,66 @@ fn parse_timeout(timeout: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Duration
     }
 }
 
+/// Helper: execute the put logic on an already-locked guard.
+/// Returns Ok(()) on success, Err(item) if the queue is full or shut down
+/// and we need to fall through to the slow path. Returns PyResult for
+/// shutdown/full errors that should be raised immediately.
+enum PutFast {
+    Done,
+    NeedBlock(Py<PyAny>),
+}
+
+fn try_put_fast(
+    inner: &mut MutexGuard<'_, QueueInner>,
+    item: Py<PyAny>,
+    block: bool,
+    not_empty: &Condvar,
+) -> Result<PutFast, PyErr> {
+    #[cfg(Py_3_13)]
+    if inner.is_shutdown {
+        return Err(ShutDown::new_err("the queue has been shut down"));
+    }
+    if !inner.is_full() {
+        inner.items.push_back(item);
+        inner.unfinished_tasks += 1;
+        if inner.not_empty_waiters > 0 {
+            not_empty.notify_one();
+        }
+        return Ok(PutFast::Done);
+    }
+    if !block {
+        return Err(Full::new_err(""));
+    }
+    Ok(PutFast::NeedBlock(item))
+}
+
+/// Helper: execute the get logic on an already-locked guard.
+enum GetFast {
+    Done(Py<PyAny>),
+    NeedBlock,
+}
+
+fn try_get_fast(
+    inner: &mut MutexGuard<'_, QueueInner>,
+    block: bool,
+    not_full: &Condvar,
+) -> Result<GetFast, PyErr> {
+    if let Some(item) = inner.items.pop_front() {
+        if inner.not_full_waiters > 0 {
+            not_full.notify_one();
+        }
+        return Ok(GetFast::Done(item));
+    }
+    #[cfg(Py_3_13)]
+    if inner.is_shutdown {
+        return Err(ShutDown::new_err("the queue has been shut down"));
+    }
+    if !block {
+        return Err(Empty::new_err(""));
+    }
+    Ok(GetFast::NeedBlock)
+}
+
 #[pymethods]
 impl Queue {
     #[new]
@@ -126,18 +186,15 @@ impl Queue {
     }
 
     fn qsize(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner.items.len()
+        self.inner.lock().items.len()
     }
 
     fn empty(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.items.is_empty()
+        self.inner.lock().items.is_empty()
     }
 
     fn full(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.is_full()
+        self.inner.lock().is_full()
     }
 
     #[pyo3(signature = (item, block=true, timeout=None))]
@@ -149,105 +206,34 @@ impl Queue {
         timeout: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         // Fast path: try-lock without detaching from the interpreter.
-        if let Ok(mut inner) = self.inner.try_lock() {
-            #[cfg(Py_3_13)]
-            if inner.is_shutdown {
-                return Err(ShutDown::new_err("the queue has been shut down"));
-            }
-            if !inner.is_full() {
-                inner.items.push_back(item);
-                inner.unfinished_tasks += 1;
-                if inner.not_empty_waiters > 0 {
-                    self.not_empty.notify_one();
+        if let Some(mut inner) = self.inner.try_lock() {
+            match try_put_fast(&mut inner, item, block, &self.not_empty)? {
+                PutFast::Done => return Ok(()),
+                PutFast::NeedBlock(item_back) => {
+                    // Need to block — drop lock, fall through to slow path.
+                    drop(inner);
+                    return self.put_slow(py, item_back, timeout);
                 }
-                return Ok(());
             }
-            if !block {
-                return Err(Full::new_err(""));
-            }
-            // Need to block — drop the lock and fall through to slow path.
-            drop(inner);
         }
 
-        // Slow path: detach from interpreter, lock, and wait.
-        let deadline = if block {
-            parse_timeout(timeout)?.map(|d| Instant::now() + d)
-        } else {
-            None
-        };
-
-        let result = py.detach(|| {
-            let mut inner = self.inner.lock().unwrap();
-
-            loop {
-                #[cfg(Py_3_13)]
-                if inner.is_shutdown {
-                    return Err(QueueError::ShutDown);
-                }
-
-                if !inner.is_full() {
-                    break;
-                }
-
-                if !block {
-                    return Err(QueueError::Full);
-                }
-
-                inner.not_full_waiters += 1;
-                match deadline {
-                    Some(dl) => {
-                        let now = Instant::now();
-                        if now >= dl {
-                            inner.not_full_waiters -= 1;
-                            return Err(QueueError::Full);
-                        }
-                        let (guard, wait_result) =
-                            self.not_full.wait_timeout(inner, dl - now).unwrap();
-                        inner = guard;
-                        inner.not_full_waiters -= 1;
-                        if wait_result.timed_out() && inner.is_full() {
-                            return Err(QueueError::Full);
-                        }
-                    }
-                    None => {
-                        inner = self.not_full.wait(inner).unwrap();
-                        inner.not_full_waiters -= 1;
-                    }
-                }
-            }
-
-            inner.items.push_back(item);
-            inner.unfinished_tasks += 1;
-            if inner.not_empty_waiters > 0 {
-                self.not_empty.notify_one();
-            }
-            Ok(())
-        });
-
-        result.map_err(|e| e.into_pyerr())
+        // Contended — detach and lock.
+        self.put_slow(py, item, timeout)
     }
 
     fn put_nowait(&self, py: Python<'_>, item: Py<PyAny>) -> PyResult<()> {
         // Fast path: try-lock without detaching.
-        if let Ok(mut inner) = self.inner.try_lock() {
-            #[cfg(Py_3_13)]
-            if inner.is_shutdown {
-                return Err(ShutDown::new_err("the queue has been shut down"));
-            }
-            if inner.is_full() {
-                return Err(Full::new_err(""));
-            }
-            inner.items.push_back(item);
-            inner.unfinished_tasks += 1;
-            if inner.not_empty_waiters > 0 {
-                self.not_empty.notify_one();
-            }
-            return Ok(());
+        if let Some(mut inner) = self.inner.try_lock() {
+            return match try_put_fast(&mut inner, item, false, &self.not_empty) {
+                Ok(PutFast::Done) => Ok(()),
+                Ok(PutFast::NeedBlock(_)) => unreachable!(),
+                Err(e) => Err(e),
+            };
         }
 
         // Contended — fall back to detach + lock.
         let result = py.detach(|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
 
             #[cfg(Py_3_13)]
             if inner.is_shutdown {
@@ -277,101 +263,33 @@ impl Queue {
         timeout: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         // Fast path: try-lock without detaching.
-        if let Ok(mut inner) = self.inner.try_lock() {
-            if let Some(item) = inner.items.pop_front() {
-                if inner.not_full_waiters > 0 {
-                    self.not_full.notify_one();
+        if let Some(mut inner) = self.inner.try_lock() {
+            match try_get_fast(&mut inner, block, &self.not_full)? {
+                GetFast::Done(item) => return Ok(item),
+                GetFast::NeedBlock => {
+                    drop(inner);
+                    return self.get_slow(py, timeout);
                 }
-                return Ok(item);
             }
-            #[cfg(Py_3_13)]
-            if inner.is_shutdown {
-                return Err(ShutDown::new_err("the queue has been shut down"));
-            }
-            if !block {
-                return Err(Empty::new_err(""));
-            }
-            // Need to block — drop the lock and fall through to slow path.
-            drop(inner);
         }
 
-        // Slow path: detach from interpreter, lock, and wait.
-        let deadline = if block {
-            parse_timeout(timeout)?.map(|d| Instant::now() + d)
-        } else {
-            None
-        };
-
-        let result: Result<Py<PyAny>, QueueError> = py.detach(|| {
-            let mut inner = self.inner.lock().unwrap();
-
-            loop {
-                if let Some(item) = inner.items.pop_front() {
-                    if inner.not_full_waiters > 0 {
-                        self.not_full.notify_one();
-                    }
-                    return Ok(item);
-                }
-
-                #[cfg(Py_3_13)]
-                if inner.is_shutdown {
-                    return Err(QueueError::ShutDown);
-                }
-
-                if !block {
-                    return Err(QueueError::Empty);
-                }
-
-                inner.not_empty_waiters += 1;
-                match deadline {
-                    Some(dl) => {
-                        let now = Instant::now();
-                        if now >= dl {
-                            inner.not_empty_waiters -= 1;
-                            return Err(QueueError::Empty);
-                        }
-                        let (guard, wait_result) =
-                            self.not_empty.wait_timeout(inner, dl - now).unwrap();
-                        inner = guard;
-                        inner.not_empty_waiters -= 1;
-                        if wait_result.timed_out() && inner.items.is_empty() {
-                            #[cfg(Py_3_13)]
-                            if inner.is_shutdown {
-                                return Err(QueueError::ShutDown);
-                            }
-                            return Err(QueueError::Empty);
-                        }
-                    }
-                    None => {
-                        inner = self.not_empty.wait(inner).unwrap();
-                        inner.not_empty_waiters -= 1;
-                    }
-                }
-            }
-        });
-
-        result.map_err(|e| e.into_pyerr())
+        // Contended — detach and lock.
+        self.get_slow(py, timeout)
     }
 
     fn get_nowait(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Fast path: try-lock without detaching.
-        if let Ok(mut inner) = self.inner.try_lock() {
-            if let Some(item) = inner.items.pop_front() {
-                if inner.not_full_waiters > 0 {
-                    self.not_full.notify_one();
-                }
-                return Ok(item);
-            }
-            #[cfg(Py_3_13)]
-            if inner.is_shutdown {
-                return Err(ShutDown::new_err("the queue has been shut down"));
-            }
-            return Err(Empty::new_err(""));
+        if let Some(mut inner) = self.inner.try_lock() {
+            return match try_get_fast(&mut inner, false, &self.not_full) {
+                Ok(GetFast::Done(item)) => Ok(item),
+                Ok(GetFast::NeedBlock) => unreachable!(),
+                Err(e) => Err(e),
+            };
         }
 
         // Contended — fall back to detach + lock.
         let result: Result<Py<PyAny>, QueueError> = py.detach(|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
 
             if let Some(item) = inner.items.pop_front() {
                 if inner.not_full_waiters > 0 {
@@ -392,7 +310,7 @@ impl Queue {
     }
 
     fn task_done(&self, py: Python<'_>) -> PyResult<()> {
-        if let Ok(mut inner) = self.inner.try_lock() {
+        if let Some(mut inner) = self.inner.try_lock() {
             if inner.unfinished_tasks == 0 {
                 return Err(PyValueError::new_err("task_done() called too many times"));
             }
@@ -404,7 +322,7 @@ impl Queue {
         }
 
         py.detach(|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             if inner.unfinished_tasks == 0 {
                 return Err(PyValueError::new_err("task_done() called too many times"));
             }
@@ -418,10 +336,10 @@ impl Queue {
 
     fn join(&self, py: Python<'_>) {
         py.detach(|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             while inner.unfinished_tasks > 0 {
                 inner.all_tasks_done_waiters += 1;
-                inner = self.all_tasks_done.wait(inner).unwrap();
+                self.all_tasks_done.wait(&mut inner);
                 inner.all_tasks_done_waiters -= 1;
             }
         });
@@ -431,7 +349,7 @@ impl Queue {
     #[pyo3(signature = (immediate=false))]
     fn shutdown(&self, py: Python<'_>, immediate: bool) {
         py.detach(|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.is_shutdown = true;
 
             if immediate {
@@ -454,7 +372,7 @@ impl Queue {
     }
 
     fn __traverse__(&self, visit: pyo3::gc::PyVisit<'_>) -> Result<(), pyo3::gc::PyTraverseError> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         for item in &inner.items {
             visit.call(item)?;
         }
@@ -462,8 +380,111 @@ impl Queue {
     }
 
     fn __clear__(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.items.clear();
+        self.inner.lock().items.clear();
+    }
+}
+
+// Private slow-path methods (not exposed to Python).
+impl Queue {
+    fn put_slow(
+        &self,
+        py: Python<'_>,
+        item: Py<PyAny>,
+        timeout: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let deadline = parse_timeout(timeout)?.map(|d| Instant::now() + d);
+
+        let result = py.detach(|| {
+            let mut inner = self.inner.lock();
+
+            loop {
+                #[cfg(Py_3_13)]
+                if inner.is_shutdown {
+                    return Err(QueueError::ShutDown);
+                }
+
+                if !inner.is_full() {
+                    break;
+                }
+
+                inner.not_full_waiters += 1;
+                match deadline {
+                    Some(dl) => {
+                        let now = Instant::now();
+                        if now >= dl {
+                            inner.not_full_waiters -= 1;
+                            return Err(QueueError::Full);
+                        }
+                        let timed_out = self.not_full.wait_for(&mut inner, dl - now).timed_out();
+                        inner.not_full_waiters -= 1;
+                        if timed_out && inner.is_full() {
+                            return Err(QueueError::Full);
+                        }
+                    }
+                    None => {
+                        self.not_full.wait(&mut inner);
+                        inner.not_full_waiters -= 1;
+                    }
+                }
+            }
+
+            inner.items.push_back(item);
+            inner.unfinished_tasks += 1;
+            if inner.not_empty_waiters > 0 {
+                self.not_empty.notify_one();
+            }
+            Ok(())
+        });
+
+        result.map_err(|e| e.into_pyerr())
+    }
+
+    fn get_slow(&self, py: Python<'_>, timeout: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        let deadline = parse_timeout(timeout)?.map(|d| Instant::now() + d);
+
+        let result: Result<Py<PyAny>, QueueError> = py.detach(|| {
+            let mut inner = self.inner.lock();
+
+            loop {
+                if let Some(item) = inner.items.pop_front() {
+                    if inner.not_full_waiters > 0 {
+                        self.not_full.notify_one();
+                    }
+                    return Ok(item);
+                }
+
+                #[cfg(Py_3_13)]
+                if inner.is_shutdown {
+                    return Err(QueueError::ShutDown);
+                }
+
+                inner.not_empty_waiters += 1;
+                match deadline {
+                    Some(dl) => {
+                        let now = Instant::now();
+                        if now >= dl {
+                            inner.not_empty_waiters -= 1;
+                            return Err(QueueError::Empty);
+                        }
+                        let timed_out = self.not_empty.wait_for(&mut inner, dl - now).timed_out();
+                        inner.not_empty_waiters -= 1;
+                        if timed_out && inner.items.is_empty() {
+                            #[cfg(Py_3_13)]
+                            if inner.is_shutdown {
+                                return Err(QueueError::ShutDown);
+                            }
+                            return Err(QueueError::Empty);
+                        }
+                    }
+                    None => {
+                        self.not_empty.wait(&mut inner);
+                        inner.not_empty_waiters -= 1;
+                    }
+                }
+            }
+        });
+
+        result.map_err(|e| e.into_pyerr())
     }
 }
 
